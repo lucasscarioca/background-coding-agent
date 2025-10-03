@@ -1,15 +1,25 @@
 import { generateText, stepCountIs, tool } from 'ai'
 import { google } from '@ai-sdk/google'
 import z from 'zod/v4'
-import fs from 'fs'
+import {
+	createPR,
+	createSandbox,
+	editFile,
+	listFiles,
+	readFile,
+} from './sandbox'
+import { Sandbox } from '@vercel/sandbox'
 
-export async function codingAgent(prompt: string) {
+export async function bgCodingAgent(prompt: string, repoUrl: string) {
+	let sandbox: Sandbox | undefined
+
 	const result = await generateText({
 		model: google('gemini-2.5-flash'),
 		prompt,
 		system: `You are a coding agent. Your responses must be concise. 
 		Use your given tools to understand the working directory and complete the given task.
-		Do not answer questions that are not coding related.`.trim(),
+		Do not answer questions that are not coding related.
+    IMPORTANT: If you make changes to the codebase, be sure to run the create_pr tool once you are done.`.trim(),
 		tools: {
 			list_files: tool({
 				description:
@@ -34,11 +44,8 @@ export async function codingAgent(prompt: string) {
 
 					const path = generatedPath?.trim() ? generatedPath : '.'
 					try {
-						console.log(`Listing files at: '${path}'`)
-						const output = fs.readdirSync(path, {
-							recursive: false,
-						})
-						console.log('[list_files output]', output)
+						if (!sandbox) sandbox = await createSandbox(repoUrl)
+						const output = await listFiles(sandbox, path)
 						return { path, output }
 					} catch (e) {
 						console.error('Error listing files:', e)
@@ -58,8 +65,8 @@ export async function codingAgent(prompt: string) {
 				}),
 				execute: async ({ path }) => {
 					try {
-						console.log(`Reading file at '${path}'`)
-						const output = fs.readFileSync(path, 'utf-8')
+						if (!sandbox) sandbox = await createSandbox(repoUrl)
+						const output = readFile(sandbox, path)
 						return { path, output }
 					} catch (e) {
 						console.error('Error reading file', e)
@@ -84,23 +91,40 @@ export async function codingAgent(prompt: string) {
 				}),
 				execute: async ({ path, old_str, new_str }) => {
 					try {
-						const fileExists = fs.existsSync(path)
-						if (fileExists && old_str) {
-							console.log(`Editing file "${path}"`)
-							const fileContents = fs.readFileSync(path, 'utf-8')
-							const newContents = fileContents.replace(
-								old_str,
-								new_str
-							)
-							fs.writeFileSync(path, newContents)
-							return { path, success: true, action: 'edit' }
-						} else {
-							console.log(`Creating file "${path}"`)
-							fs.writeFileSync(path, new_str)
-							return { path, success: true, action: 'create' }
-						}
+						if (!sandbox) sandbox = await createSandbox(repoUrl)
+						await editFile(sandbox, path, old_str || '', new_str)
+						return { success: true }
 					} catch (e) {
 						console.error(`Error editing file "${path}":`, e)
+						return { error: e, success: false }
+					}
+				},
+			}),
+			create_pr: tool({
+				description:
+					"Create a pull request with the current changes. This will add all files, commit changes, push to a new branch, and create a PR using Github's REST API. Use this as the final step when making changes.",
+				inputSchema: z.object({
+					title: z.string().describe('The title of the pull request'),
+					body: z
+						.string()
+						.describe('The body/description of the pull request'),
+					branch: z
+						.string()
+						.nullable()
+						.describe(
+							'The name of the branch to create (defaults to a generated name)'
+						),
+				}),
+				execute: async ({ title, body, branch }) => {
+					try {
+						const { pr_url } = await createPR(sandbox!, repoUrl, {
+							title,
+							body,
+							branch,
+						})
+						return { success: true, linkToPR: pr_url }
+					} catch (e) {
+						console.error('Error creating PR:', e)
 						return { error: e, success: false }
 					}
 				},
@@ -108,5 +132,9 @@ export async function codingAgent(prompt: string) {
 		},
 		stopWhen: stepCountIs(10),
 	})
+
+	if (sandbox) {
+		await sandbox.stop()
+	}
 	return { response: result.text }
 }
